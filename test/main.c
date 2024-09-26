@@ -67,6 +67,8 @@
 #include <qz_utils.h>
 #include <sys/wait.h>
 
+#include <zlib.h>
+
 #define QZ_FMT_NAME         "QZ"
 #define GZIP_FMT_NAME       "GZIP"
 #define MAX_FMT_NAME        8
@@ -162,6 +164,7 @@ typedef struct {
     int comp_algorithm;
     int sw_backup;
     int hw_buff_sz;
+    int engine_type;
     int comp_lvl;
     int req_cnt_thrshold;
     int huffman_hdr;
@@ -1201,6 +1204,39 @@ end:
     pthread_exit((void *)NULL);
 }
 
+int zlibCompress(const unsigned char *src, unsigned int *src_len,
+                 unsigned char *dest, unsigned int *dest_len)
+{
+    z_stream _stream;
+    memset(&_stream, 0, sizeof(z_stream));
+    int level = Z_DEFAULT_COMPRESSION;
+    int memLevel = 8; //default
+    int window_bits = 15;
+
+    int ret = deflateInit2(&_stream, level, Z_DEFLATED, window_bits,
+                        memLevel, Z_DEFAULT_STRATEGY);
+    if (ret != Z_OK) {
+        return false;
+    }
+
+    _stream.next_in = (Bytef*)src;
+    _stream.avail_in = (uInt)*src_len;
+
+    _stream.next_out = (Bytef*)dest;
+    _stream.avail_out = (uInt)*dest_len;
+
+    ret = deflate(&_stream, Z_FINISH);
+    if (ret == Z_STREAM_END) {
+        ret = 0;
+        *dest_len = *dest_len - _stream.avail_out;
+    } else {
+        ret = -1;
+    }
+
+    deflateEnd(&_stream);
+
+    return ret;
+}
 
 void *qzCompressAndDecompress(void *arg)
 {
@@ -1221,6 +1257,7 @@ void *qzCompressAndDecompress(void *arg)
     const int count = ((TestArg_T *)arg)->count;
     const int gen_data = ((TestArg_T *)arg)->gen_data;
     int thread_sleep = ((TestArg_T *)arg)->thread_sleep;
+    int engine_type = ((TestArg_T *)arg)->engine_type;
     QzSession_T sess = {0};
 
     if (!org_src_sz) {
@@ -1370,9 +1407,16 @@ void *qzCompressAndDecompress(void *arg)
                          (org_src_sz - consumed);
                 out_sz = comp_out_sz - produced;
 
-                rc = qzCompress(&sess, src + consumed, (uint32_t *)(&in_sz),
+                if(0 == engine_type) {
+                    rc = qzCompress(&sess, src + consumed, (uint32_t *)(&in_sz),
                                 comp_out + produced,
                                 (uint32_t *)(&out_sz), 1);
+                } else {
+                    rc = zlibCompress(src + consumed, (uint32_t *)(&in_sz),
+                                comp_out + produced,
+                                (uint32_t *)(&out_sz));
+                }
+
                 if (rc != QZ_OK) {
                     QZ_ERROR("ERROR: Compression FAILED with return value: %d\n", rc);
                     dumpInputData(in_sz, src + consumed);
@@ -3921,6 +3965,7 @@ done:
     "    -l loop count         default is 2\n"                                  \
     "    -v                    verify, disabled by default\n"                   \
     "    -e init engine        enable | disable. enabled by default\n"          \
+    "    -E engine type        0: QAT | 1 SW(zlib). 0 by default\n"             \
     "    -s init session       enable | disable. enabled by default\n"          \
     "    -A comp_algorithm     deflate | lz4 | lz4s\n"                          \
     "    -B swBack             0 means disable sw\n"                            \
@@ -3999,7 +4044,7 @@ int main(int argc, char *argv[])
     s1.sa_flags = 0;
     sigaction(SIGINT, &s1, NULL);
 
-    const char *optstring = "m:t:A:C:D:F:L:T:i:l:e:s:r:B:O:S:P:M:b:p:vh";
+    const char *optstring = "m:t:A:C:D:F:L:T:i:l:e:E:s:r:B:O:S:P:M:b:p:vh";
     int opt = 0, loop_cnt = 2, verify = 0;
     int disable_init_engine = 0, disable_init_session = 0;
     char *stop = NULL;
@@ -4023,7 +4068,7 @@ int main(int argc, char *argv[])
     args.polling_mode = default_params.common_params.polling_mode;
     args.req_cnt_thrshold = default_params.common_params.req_cnt_thrshold;
     args.max_forks = default_params.common_params.max_forks;
-
+    args.engine_type = 0;
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
@@ -4145,6 +4190,16 @@ int main(int argc, char *argv[])
                 disable_init_engine = 1;
             } else {
                 QZ_ERROR("Error init qat engine arg: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 'E':
+            if (strcmp(optarg, "0") == 0) {
+                args.engine_type = 0;
+            } else if (strcmp(optarg, "1") == 0) {
+                args.engine_type = 1;
+            } else {
+                QZ_ERROR("Error engine type arg: %s\n", optarg);
                 return -1;
             }
             break;
